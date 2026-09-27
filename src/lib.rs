@@ -91,18 +91,8 @@ const GENERIC_READ_WRITE_ACCESS: u32 = 0xC000_0000u32;
 /// UI 操作から内部パイプへ接続する際の待機時間（ミリ秒）。
 const UI_PIPE_WAIT_MS: u32 = 5_000;
 
-/// 先頭無音トリムの音量閾値。
-/// この値以上のRMSが一定時間続いたら発声開始とみなす。
-const TRIM_THRESHOLD_DBFS: f64 = -45.0;
-
 /// RMSを計算する窓の長さ。
 const TRIM_WINDOW_MS: usize = 10;
-
-/// 閾値を超えた状態がこの時間続いたら発声開始とみなす。
-const TRIM_HOLD_MS: usize = 30;
-
-/// 語頭欠け防止のため、検出位置より前に残す時間。
-const TRIM_PREROLL_MS: usize = 80;
 
 /// 録音状態を保持するグローバルフラグ。
 /// egui パネルと `set_recording_indicator` から共有して参照する。
@@ -558,6 +548,8 @@ fn detect_onset_from_samples<I>(
     samples: I,
     channels: usize,
     sample_rate: usize,
+    threshold_dbfs: f64,
+    hold_ms: usize,
 ) -> Result<Option<usize>, String>
 where
     I: Iterator<Item = Result<f64, String>>,
@@ -565,9 +557,9 @@ where
     let window_frames = (sample_rate * TRIM_WINDOW_MS / 1000).max(1);
     let window_samples = window_frames.saturating_mul(channels).max(1);
 
-    let hold_windows = ((TRIM_HOLD_MS + TRIM_WINDOW_MS - 1) / TRIM_WINDOW_MS).max(1);
+    let hold_windows = ((hold_ms + TRIM_WINDOW_MS - 1) / TRIM_WINDOW_MS).max(1);
 
-    let threshold = 10.0_f64.powf(TRIM_THRESHOLD_DBFS / 20.0);
+    let threshold = 10.0_f64.powf(threshold_dbfs / 20.0);
 
     let mut sum_squares = 0.0_f64;
     let mut sample_count = 0usize;
@@ -685,7 +677,7 @@ fn rewrite_wav_from_frame(
 }
 
 /// 録音済みWAVの先頭無音を自動的に削除する。
-fn trim_leading_silence(path: &Path) -> Result<(), String> {
+fn trim_leading_silence(path: &Path, config: &shared_config::Config) -> Result<(), String> {
     let mut reader =
         hound::WavReader::open(path).map_err(|e| format!("WAVの読み込みに失敗しました: {}", e))?;
 
@@ -707,6 +699,8 @@ fn trim_leading_silence(path: &Path) -> Result<(), String> {
             }),
             channels,
             sample_rate,
+            config.trim_threshold_dbfs,
+            config.trim_hold_ms as usize,
         )?,
 
         (hound::SampleFormat::Int, 32) => detect_onset_from_samples(
@@ -717,6 +711,8 @@ fn trim_leading_silence(path: &Path) -> Result<(), String> {
             }),
             channels,
             sample_rate,
+            config.trim_threshold_dbfs,
+            config.trim_hold_ms as usize,
         )?,
 
         (hound::SampleFormat::Float, 32) => detect_onset_from_samples(
@@ -725,6 +721,8 @@ fn trim_leading_silence(path: &Path) -> Result<(), String> {
                 .map(|sample| sample.map(|s| s as f64).map_err(|e| e.to_string())),
             channels,
             sample_rate,
+            config.trim_threshold_dbfs,
+            config.trim_hold_ms as usize,
         )?,
 
         _ => {
@@ -745,7 +743,7 @@ fn trim_leading_silence(path: &Path) -> Result<(), String> {
         return Ok(());
     };
 
-    let preroll_frames = sample_rate * TRIM_PREROLL_MS / 1000;
+    let preroll_frames = sample_rate * config.trim_preroll_ms as usize / 1000;
 
     let trim_start_frame = onset_frame.saturating_sub(preroll_frames);
 
@@ -758,7 +756,7 @@ fn trim_leading_silence(path: &Path) -> Result<(), String> {
         "先頭無音をトリムします: {} frames (onset={}, preroll={}ms)",
         trim_start_frame,
         onset_frame,
-        TRIM_PREROLL_MS
+        config.trim_preroll_ms
     );
 
     rewrite_wav_from_frame(path, spec, trim_start_frame)
@@ -811,24 +809,86 @@ unsafe impl Sync for AudioRecPlugin {}
 /// egui による録音パネルアプリ。
 struct RecordingPanelApp {
     recording: Arc<AtomicBool>,
+    config: shared_config::Config,
 }
 
 impl aviutl2_eframe::eframe::App for RecordingPanelApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut aviutl2_eframe::eframe::Frame) {
         let is_recording = self.recording.load(Ordering::Relaxed);
+
         ui.horizontal(|ui| {
             if ui.button("開始").clicked() {
                 on_ui_start_recording();
             }
+
             if ui.button("停止").clicked() {
                 on_ui_stop_recording();
             }
         });
+
         ui.separator();
+
         ui.label(if is_recording {
             "● 録音中"
         } else {
             "○ 停止中"
+        });
+
+        ui.separator();
+
+        ui.collapsing("先頭無音トリム", |ui| {
+            ui.checkbox(
+                &mut self.config.trim_leading_silence,
+                "先頭無音を自動トリム",
+            );
+
+            ui.add_enabled_ui(self.config.trim_leading_silence, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("閾値");
+                    ui.add(
+                        egui::DragValue::new(&mut self.config.trim_threshold_dbfs)
+                            .speed(0.5)
+                            .suffix(" dBFS"),
+                    );
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Hold");
+                    ui.add(
+                        egui::DragValue::new(&mut self.config.trim_hold_ms)
+                            .speed(1.0)
+                            .suffix(" ms"),
+                    );
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Pre-roll");
+                    ui.add(
+                        egui::DragValue::new(&mut self.config.trim_preroll_ms)
+                            .speed(1.0)
+                            .suffix(" ms"),
+                    );
+                });
+            });
+
+            if ui.button("設定を保存").clicked() {
+                // 異常値を防ぐ。
+                self.config.trim_threshold_dbfs =
+                    self.config.trim_threshold_dbfs.clamp(-80.0, -10.0);
+
+                self.config.trim_hold_ms = self.config.trim_hold_ms.clamp(10, 1000);
+
+                self.config.trim_preroll_ms = self.config.trim_preroll_ms.clamp(0, 2000);
+
+                match shared_config::save_config(&self.config) {
+                    Ok(path) => {
+                        tracing::info!("録音設定を保存しました: {}", path.display());
+                    }
+                    Err(e) => {
+                        tracing::error!("録音設定の保存に失敗しました: {}", e);
+                    }
+                }
+            }
         });
     }
 }
@@ -858,8 +918,10 @@ impl GenericPlugin for AudioRecPlugin {
                 cc.egui_ctx.set_fonts(aviutl2_eframe::aviutl2_fonts());
 
                 PANEL_EGUI_CTX.get_or_init(|| cc.egui_ctx.clone());
-                let app: Box<dyn aviutl2_eframe::eframe::App> =
-                    Box::new(RecordingPanelApp { recording });
+                let app: Box<dyn aviutl2_eframe::eframe::App> = Box::new(RecordingPanelApp {
+                    recording,
+                    config: shared_config::load_config(),
+                });
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(app)
             })?;
 
@@ -1430,9 +1492,13 @@ fn process_command(
 
                 let insert_path = current_recording_path.take();
 
-                if let Some(path) = insert_path.as_deref() {
-                    if let Err(e) = trim_leading_silence(path) {
-                        tracing::warn!("先頭無音の自動トリムに失敗しました: {}", e);
+                let config = shared_config::load_config();
+
+                if config.trim_leading_silence {
+                    if let Some(path) = insert_path.as_deref() {
+                        if let Err(e) = trim_leading_silence(path, &config) {
+                            tracing::warn!("先頭無音の自動トリムに失敗しました: {}", e);
+                        }
                     }
                 }
 
