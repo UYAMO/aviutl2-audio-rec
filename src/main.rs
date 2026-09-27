@@ -598,7 +598,7 @@ mod tests {
     /// 存在しないディレクトリへのパスはエラーになることを確認する。
     #[test]
     fn test_validate_path_nonexistent_directory() {
-        let result = validate_output_path("/nonexistent_dir_12345/subdir/output.wav");
+        let result = validate_output_path(r"C:\nonexistent_dir_12345\subdir\output.wav");
         assert!(result.is_err());
         let msg = result.unwrap_err();
         assert!(
@@ -646,6 +646,7 @@ mod tests {
         let config = shared_config::Config {
             save_path: Some("C:\\録音".to_string()),
             buffer_size_frames: Some(4096),
+            ..Default::default()
         };
         let json = serde_json::to_string(&config).unwrap();
         let restored: shared_config::Config = serde_json::from_str(&json).unwrap();

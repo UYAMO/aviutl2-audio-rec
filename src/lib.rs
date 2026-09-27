@@ -920,7 +920,10 @@ impl GenericPlugin for AudioRecPlugin {
 
             PANEL_EGUI_CTX.get_or_init(|| cc.egui_ctx.clone());
             let app: Box<dyn aviutl2_eframe::eframe::App> =
-                Box::new(RecordingPanelApp { recording });
+                Box::new(RecordingPanelApp {
+                    recording,
+                    config: shared_config::load_config(),
+                });
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(app)
         })?;
 
@@ -2169,11 +2172,11 @@ mod tests {
     fn test_process_command_start_ok() {
         let mut recorder = MockRecorder::new();
         let mut path = None;
-        let (response, insert) = process_command("start:/tmp/test.wav", &mut recorder, &mut path, None);
+        let (response, insert) = process_command(r"start:C:\tmp\test.wav", &mut recorder, &mut path, None);
         assert_eq!(response, "ok");
         assert!(recorder.is_recording());
         assert!(insert.is_none());
-        assert_eq!(path.as_deref(), Some(Path::new("/tmp/test.wav")));
+        assert_eq!(path.as_deref(), Some(Path::new(r"C:\tmp\test.wav")));
     }
 
     /// `start` コマンドにバッファサイズが含まれる場合も正常に処理されることを確認する。
@@ -2182,11 +2185,11 @@ mod tests {
         let mut recorder = MockRecorder::new();
         let mut path = None;
         let (response, insert) =
-            process_command("start:4096:/tmp/test.wav", &mut recorder, &mut path, None);
+            process_command(r"start:4096:C:\tmp\test.wav", &mut recorder, &mut path, None);
         assert_eq!(response, "ok");
         assert!(recorder.is_recording());
         assert!(insert.is_none());
-        assert_eq!(path.as_deref(), Some(Path::new("/tmp/test.wav")));
+        assert_eq!(path.as_deref(), Some(Path::new(r"C:\tmp\test.wav")));
     }
 
     /// 録音中に `start` を送信した場合は冪等処理になることを確認する。
@@ -2194,7 +2197,7 @@ mod tests {
     fn test_process_command_start_noop_when_recording() {
         let mut recorder = MockRecorder::new().already_recording();
         let mut path = None;
-        let (response, _) = process_command("start:0:/tmp/test.wav", &mut recorder, &mut path, None);
+        let (response, _) = process_command(r"start:0:C:\tmp\test.wav", &mut recorder, &mut path, None);
         assert!(response.starts_with("noop:"), "response was: {}", response);
     }
 
@@ -2202,12 +2205,12 @@ mod tests {
     #[test]
     fn test_process_command_stop_ok() {
         let mut recorder = MockRecorder::new().already_recording();
-        let mut current = Some(PathBuf::from("/tmp/test.wav"));
-        let (response, insert) = process_command("stop", &mut recorder, &mut current, None);
+        let mut current = Some(PathBuf::from(r"C:\tmp\test.wav"));
+        let (response, insert) = process_command(r"stop", &mut recorder, &mut current, None);
         assert_eq!(response, "ok");
         assert!(!recorder.is_recording());
         // stop 後は挿入パスが返され、current_path はクリアされる
-        assert_eq!(insert.as_deref(), Some(Path::new("/tmp/test.wav")));
+        assert_eq!(insert.as_deref(), Some(Path::new(r"C:\tmp\test.wav")));
         assert!(current.is_none());
     }
 
@@ -2225,7 +2228,7 @@ mod tests {
     fn test_process_command_start_error() {
         let mut recorder = MockRecorder::new().with_start_error("デバイスエラー");
         let mut path = None;
-        let (response, _) = process_command("start:0:/tmp/test.wav", &mut recorder, &mut path, None);
+        let (response, _) = process_command(r"start:C:\tmp\test.wav", &mut recorder, &mut path, None);
         assert!(response.starts_with("err:"), "response was: {}", response);
         assert!(response.contains("デバイスエラー"));
     }
@@ -2236,7 +2239,7 @@ mod tests {
         let mut recorder = MockRecorder::new()
             .already_recording()
             .with_stop_error("ファイナライズ失敗");
-        let mut current = Some(PathBuf::from("/tmp/test.wav"));
+        let mut current = Some(PathBuf::from("C:\tmp\test.wav"));
         let (response, insert) = process_command("stop", &mut recorder, &mut current, None);
         assert!(response.starts_with("err:"), "response was: {}", response);
         assert!(response.contains("ファイナライズ失敗"));
