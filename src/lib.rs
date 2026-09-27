@@ -51,9 +51,7 @@ use aviutl2::generic::{
 };
 use aviutl2_eframe::{self, egui};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use windows::Win32::Foundation::{
-    CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
-};
+use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_NONE, OPEN_EXISTING,
     PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
@@ -92,6 +90,19 @@ const GENERIC_READ_WRITE_ACCESS: u32 = 0xC000_0000u32;
 
 /// UI 操作から内部パイプへ接続する際の待機時間（ミリ秒）。
 const UI_PIPE_WAIT_MS: u32 = 5_000;
+
+/// 先頭無音トリムの音量閾値。
+/// この値以上のRMSが一定時間続いたら発声開始とみなす。
+const TRIM_THRESHOLD_DBFS: f64 = -45.0;
+
+/// RMSを計算する窓の長さ。
+const TRIM_WINDOW_MS: usize = 10;
+
+/// 閾値を超えた状態がこの時間続いたら発声開始とみなす。
+const TRIM_HOLD_MS: usize = 30;
+
+/// 語頭欠け防止のため、検出位置より前に残す時間。
+const TRIM_PREROLL_MS: usize = 80;
 
 /// 録音状態を保持するグローバルフラグ。
 /// egui パネルと `set_recording_indicator` から共有して参照する。
@@ -539,6 +550,220 @@ fn write_samples_f32(
     }
 }
 
+/// 正規化済みサンプル列から発声開始フレームを検出する。
+///
+/// 10ms単位でRMSを計算し、一定時間連続して閾値を超えた位置を
+/// 発声開始とみなす。
+fn detect_onset_from_samples<I>(
+    samples: I,
+    channels: usize,
+    sample_rate: usize,
+) -> Result<Option<usize>, String>
+where
+    I: Iterator<Item = Result<f64, String>>,
+{
+    let window_frames = (sample_rate * TRIM_WINDOW_MS / 1000).max(1);
+    let window_samples = window_frames.saturating_mul(channels).max(1);
+
+    let hold_windows = ((TRIM_HOLD_MS + TRIM_WINDOW_MS - 1) / TRIM_WINDOW_MS).max(1);
+
+    let threshold = 10.0_f64.powf(TRIM_THRESHOLD_DBFS / 20.0);
+
+    let mut sum_squares = 0.0_f64;
+    let mut sample_count = 0usize;
+
+    let mut completed_windows = 0usize;
+    let mut consecutive_loud_windows = 0usize;
+
+    for sample in samples {
+        let sample = sample?;
+
+        sum_squares += sample * sample;
+        sample_count += 1;
+
+        if sample_count >= window_samples {
+            let rms = (sum_squares / sample_count as f64).sqrt();
+
+            if rms >= threshold {
+                consecutive_loud_windows += 1;
+
+                if consecutive_loud_windows >= hold_windows {
+                    let onset_window = completed_windows + 1 - hold_windows;
+
+                    return Ok(Some(onset_window * window_frames));
+                }
+            } else {
+                consecutive_loud_windows = 0;
+            }
+
+            completed_windows += 1;
+            sum_squares = 0.0;
+            sample_count = 0;
+        }
+    }
+
+    Ok(None)
+}
+
+/// WAVの指定フレームより前を削除してファイルを書き直す。
+fn rewrite_wav_from_frame(
+    path: &Path,
+    spec: hound::WavSpec,
+    start_frame: usize,
+) -> Result<(), String> {
+    let channels = spec.channels as usize;
+
+    let skip_samples = start_frame
+        .checked_mul(channels)
+        .ok_or_else(|| "トリム位置の計算でオーバーフローしました".to_string())?;
+
+    let temp_path = path.with_extension("trim.tmp.wav");
+
+    // 前回異常終了時などの一時ファイルが残っていたら削除する。
+    if temp_path.exists() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+
+    let mut reader = hound::WavReader::open(path)
+        .map_err(|e| format!("トリム用WAVの読み込みに失敗しました: {}", e))?;
+
+    let mut writer = hound::WavWriter::create(&temp_path, spec)
+        .map_err(|e| format!("トリム用一時WAVの作成に失敗しました: {}", e))?;
+
+    match (spec.sample_format, spec.bits_per_sample) {
+        (hound::SampleFormat::Int, 16) => {
+            for sample in reader.samples::<i16>().skip(skip_samples) {
+                let sample = sample.map_err(|e| format!("WAV読み込みエラー: {}", e))?;
+
+                writer
+                    .write_sample(sample)
+                    .map_err(|e| format!("WAV書き込みエラー: {}", e))?;
+            }
+        }
+
+        (hound::SampleFormat::Int, 32) => {
+            for sample in reader.samples::<i32>().skip(skip_samples) {
+                let sample = sample.map_err(|e| format!("WAV読み込みエラー: {}", e))?;
+
+                writer
+                    .write_sample(sample)
+                    .map_err(|e| format!("WAV書き込みエラー: {}", e))?;
+            }
+        }
+
+        (hound::SampleFormat::Float, 32) => {
+            for sample in reader.samples::<f32>().skip(skip_samples) {
+                let sample = sample.map_err(|e| format!("WAV読み込みエラー: {}", e))?;
+
+                writer
+                    .write_sample(sample)
+                    .map_err(|e| format!("WAV書き込みエラー: {}", e))?;
+            }
+        }
+
+        _ => {
+            return Err(format!(
+                "トリム未対応のWAV形式です: {:?}, {} bit",
+                spec.sample_format, spec.bits_per_sample
+            ));
+        }
+    }
+
+    writer
+        .finalize()
+        .map_err(|e| format!("トリム後WAVの確定に失敗しました: {}", e))?;
+
+    // 元ファイルの読み込みハンドルを閉じてから置き換える。
+    drop(reader);
+
+    std::fs::copy(&temp_path, path)
+        .map_err(|e| format!("トリム後WAVへの置き換えに失敗しました: {}", e))?;
+
+    let _ = std::fs::remove_file(&temp_path);
+
+    Ok(())
+}
+
+/// 録音済みWAVの先頭無音を自動的に削除する。
+fn trim_leading_silence(path: &Path) -> Result<(), String> {
+    let mut reader =
+        hound::WavReader::open(path).map_err(|e| format!("WAVの読み込みに失敗しました: {}", e))?;
+
+    let spec = reader.spec();
+
+    let channels = spec.channels as usize;
+    let sample_rate = spec.sample_rate as usize;
+
+    if channels == 0 || sample_rate == 0 {
+        return Err("不正なWAVフォーマットです".to_string());
+    }
+
+    let onset_frame = match (spec.sample_format, spec.bits_per_sample) {
+        (hound::SampleFormat::Int, 16) => detect_onset_from_samples(
+            reader.samples::<i16>().map(|sample| {
+                sample
+                    .map(|s| s as f64 / 32768.0)
+                    .map_err(|e| e.to_string())
+            }),
+            channels,
+            sample_rate,
+        )?,
+
+        (hound::SampleFormat::Int, 32) => detect_onset_from_samples(
+            reader.samples::<i32>().map(|sample| {
+                sample
+                    .map(|s| s as f64 / 2147483648.0)
+                    .map_err(|e| e.to_string())
+            }),
+            channels,
+            sample_rate,
+        )?,
+
+        (hound::SampleFormat::Float, 32) => detect_onset_from_samples(
+            reader
+                .samples::<f32>()
+                .map(|sample| sample.map(|s| s as f64).map_err(|e| e.to_string())),
+            channels,
+            sample_rate,
+        )?,
+
+        _ => {
+            return Err(format!(
+                "トリム未対応のWAV形式です: {:?}, {} bit",
+                spec.sample_format, spec.bits_per_sample
+            ));
+        }
+    };
+
+    drop(reader);
+
+    let Some(onset_frame) = onset_frame else {
+        tracing::info!(
+            "発声開始を検出できなかったため、先頭無音トリムを行いません: {}",
+            path.display()
+        );
+        return Ok(());
+    };
+
+    let preroll_frames = sample_rate * TRIM_PREROLL_MS / 1000;
+
+    let trim_start_frame = onset_frame.saturating_sub(preroll_frames);
+
+    if trim_start_frame == 0 {
+        tracing::info!("トリム不要です: {}", path.display());
+        return Ok(());
+    }
+
+    tracing::info!(
+        "先頭無音をトリムします: {} frames (onset={}, preroll={}ms)",
+        trim_start_frame,
+        onset_frame,
+        TRIM_PREROLL_MS
+    );
+
+    rewrite_wav_from_frame(path, spec, trim_start_frame)
+}
+
 // ─────────────────────────────────────────────────────────────
 // プラグイン構造体
 // ─────────────────────────────────────────────────────────────
@@ -600,7 +825,11 @@ impl aviutl2_eframe::eframe::App for RecordingPanelApp {
             }
         });
         ui.separator();
-        ui.label(if is_recording { "● 録音中" } else { "○ 停止中" });
+        ui.label(if is_recording {
+            "● 録音中"
+        } else {
+            "○ 停止中"
+        });
     }
 }
 
@@ -617,21 +846,22 @@ impl GenericPlugin for AudioRecPlugin {
         tracing::info!("AviUtl2 マイク録音プラグインを初期化中...");
 
         let recording = Arc::clone(recording_state_flag());
-        let panel = aviutl2_eframe::EframeWindow::new("AviUtl2AudioRecPanel", move |cc, _handle| {
-            cc.egui_ctx.all_styles_mut(|style| {
-                style.visuals = aviutl2_eframe::aviutl2_visuals();
-            });
+        let panel =
+            aviutl2_eframe::EframeWindow::new("AviUtl2AudioRecPanel", move |cc, _handle| {
+                cc.egui_ctx.all_styles_mut(|style| {
+                    style.visuals = aviutl2_eframe::aviutl2_visuals();
+                });
 
-            // AviUtl2 が設定しているフォントを egui に適用する。
-            // aviutl2_eframe::aviutl2_fonts() は fontdb でシステムフォントを検索し、
-            // AviUtl2 の Control / EditControl 設定フォントを読み込む。
-            cc.egui_ctx.set_fonts(aviutl2_eframe::aviutl2_fonts());
+                // AviUtl2 が設定しているフォントを egui に適用する。
+                // aviutl2_eframe::aviutl2_fonts() は fontdb でシステムフォントを検索し、
+                // AviUtl2 の Control / EditControl 設定フォントを読み込む。
+                cc.egui_ctx.set_fonts(aviutl2_eframe::aviutl2_fonts());
 
-            PANEL_EGUI_CTX.get_or_init(|| cc.egui_ctx.clone());
-            let app: Box<dyn aviutl2_eframe::eframe::App> =
-                Box::new(RecordingPanelApp { recording });
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(app)
-        })?;
+                PANEL_EGUI_CTX.get_or_init(|| cc.egui_ctx.clone());
+                let app: Box<dyn aviutl2_eframe::eframe::App> =
+                    Box::new(RecordingPanelApp { recording });
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(app)
+            })?;
 
         Ok(Self {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
@@ -1197,7 +1427,15 @@ fn process_command(
         match recorder.stop() {
             Ok(()) => {
                 tracing::info!("録音を停止しました");
+
                 let insert_path = current_recording_path.take();
+
+                if let Some(path) = insert_path.as_deref() {
+                    if let Err(e) = trim_leading_silence(path) {
+                        tracing::warn!("先頭無音の自動トリムに失敗しました: {}", e);
+                    }
+                }
+
                 ("ok".to_string(), insert_path)
             }
             Err(e) => {
